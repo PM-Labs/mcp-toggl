@@ -14,6 +14,7 @@ const authCodes = {};
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
 
 // Sessions: sessionId -> { proc, pending: Map<id, resolver>, buffer, timer }
 const sessions = new Map();
