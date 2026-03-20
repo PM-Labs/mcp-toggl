@@ -217,6 +217,48 @@ function buildMcpServer() {
     }
   );
 
+
+  server.tool(
+    'get_client_summary',
+    'Get total hours per client for a date range, broken down by project and team member',
+    {
+      start_date:  z.string().describe('Start date YYYY-MM-DD'),
+      end_date:    z.string().describe('End date YYYY-MM-DD'),
+      client_name: z.string().optional().describe('Filter by client name (partial match, case-insensitive)'),
+    },
+    async ({ start_date, end_date, client_name }) => {
+      const { projMap, userMap } = await getMaps();
+      const raw = await fetchEntries(start_date, end_date);
+      const byClient = {};
+      for (const e of raw) {
+        const proj = projMap[e.project_id] ?? { name: 'No project', client: '' };
+        const user = userMap[e.user_id] ?? { name: e.username ?? 'Unknown' };
+        const client = proj.client || '(no client)';
+        if (client_name && !client.toLowerCase().includes(client_name.toLowerCase())) continue;
+        if (!byClient[client]) byClient[client] = { secs: 0, byProject: {}, byUser: {} };
+        const secs = (e.time_entries ?? []).reduce((s, te) => s + te.seconds, 0);
+        byClient[client].secs += secs;
+        byClient[client].byProject[proj.name] = (byClient[client].byProject[proj.name] ?? 0) + secs;
+        byClient[client].byUser[user.name] = (byClient[client].byUser[user.name] ?? 0) + secs;
+      }
+      if (!Object.keys(byClient).length) {
+        const filter = client_name ? ` for client matching "${client_name}"` : '';
+        return { content: [{ type: 'text', text: `No entries found${filter} between ${start_date} and ${end_date}` }] };
+      }
+      const lines = [`Client summary: ${start_date} → ${end_date}`, '─'.repeat(40)];
+      for (const [client, { secs, byProject, byUser }] of Object.entries(byClient).sort()) {
+        lines.push(`\n${client} — ${fmtDur(secs)} (${toHrs(secs)} hrs)`);
+        lines.push('  By project:');
+        for (const [proj, s] of Object.entries(byProject).sort(([, a], [, b]) => b - a))
+          lines.push(`    ${fmtDur(s).padEnd(8)} ${proj}`);
+        lines.push('  By team member:');
+        for (const [user, s] of Object.entries(byUser).sort(([, a], [, b]) => b - a))
+          lines.push(`    ${fmtDur(s).padEnd(8)} ${user}`);
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
   return server;
 }
 
