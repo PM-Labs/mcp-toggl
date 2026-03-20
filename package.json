@@ -1,12 +1,14 @@
 {
-  "name": "toggl-mcp-proxy",
-  "version": "1.0.0",
+  "name": "mcp-toggl",
+  "version": "2.0.0",
+  "description": "Toggl MCP Server — queries all workspace members via Reports API v3",
   "type": "module",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@verygoodplugins/mcp-toggl": "latest",
-    "express": "^4.18.2"
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "express": "^4.18.2",
+    "zod": "^3.24.2"
   }
 }

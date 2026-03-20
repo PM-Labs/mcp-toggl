@@ -1,190 +1,319 @@
 import express from 'express';
-import { spawn } from 'child_process';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { createHash, randomUUID } from 'crypto';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { z } from 'zod';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const PORT = parseInt(process.env.PORT || '8080');
-const AUTH_TOKEN = process.env.MCP_AUTH_TOKEN?.trim();
-const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID?.trim();
+// ── Config ────────────────────────────────────────────────────────────────────
+const PORT              = parseInt(process.env.PORT || '8080');
+const AUTH_TOKEN        = process.env.MCP_AUTH_TOKEN?.trim();
+const OAUTH_CLIENT_ID   = process.env.OAUTH_CLIENT_ID?.trim();
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET?.trim();
+const TOGGL_API_KEY     = process.env.TOGGL_API_KEY ?? '';
+const WORKSPACE_ID      = process.env.TOGGL_WORKSPACE_ID ?? '';
 
-const authCodes = {};
+const TOGGL_AUTH = Buffer.from(`${TOGGL_API_KEY}:api_token`).toString('base64');
 
+// ── Toggl API helpers ─────────────────────────────────────────────────────────
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function togglRequest(method, path, body, attempt = 1) {
+  const res = await fetch(`https://api.track.toggl.com${path}`, {
+    method,
+    headers: { 'Authorization': `Basic ${TOGGL_AUTH}`, 'Content-Type': 'application/json' },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (res.status === 402 || res.status === 429) {
+    const text = await res.text();
+    const match = text.match(/reset in (\d+) second/);
+    const wait  = match ? parseInt(match[1]) + 5 : 65;
+    if (attempt <= 3) { await sleep(wait * 1000); return togglRequest(method, path, body, attempt + 1); }
+    throw new Error(`Rate limit exceeded after 3 attempts`);
+  }
+  if (!res.ok) { const t = await res.text(); throw new Error(`Toggl ${res.status} ${path}: ${t.slice(0, 200)}`); }
+  return res.json();
+}
+
+const togglGet  = p      => togglRequest('GET',  p);
+const togglPost = (p, b) => togglRequest('POST', p, b);
+
+async function listUsers() {
+  const data = await togglGet(`/api/v9/workspaces/${WORKSPACE_ID}/workspace_users`);
+  return data.map(u => ({ id: u.uid ?? u.id, name: u.name, email: u.email ?? '' }));
+}
+
+async function listProjects() {
+  const all = [];
+  let page = 1;
+  while (true) {
+    const data = await togglGet(`/api/v9/workspaces/${WORKSPACE_ID}/projects?active=both&per_page=200&page=${page}`);
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < 200) break;
+    page++;
+  }
+  return all.map(p => ({ id: p.id, name: p.name, client: p.client_name ?? '' }));
+}
+
+// Reports API v3 — cursor-paginated, queries all workspace members
+async function fetchEntries(startDate, endDate, userIds) {
+  const all = [];
+  let firstRowNumber = 1;
+  while (true) {
+    const body = { start_date: startDate, end_date: endDate, page_size: 1000 };
+    if (userIds?.length) body.user_ids = userIds;
+    if (firstRowNumber > 1) body.first_row_number = firstRowNumber;
+    const data = await togglPost(`/reports/api/v3/workspace/${WORKSPACE_ID}/search/time_entries`, body);
+    if (!Array.isArray(data) || data.length === 0) break;
+    all.push(...data);
+    if (data.length < 1000) break;
+    firstRowNumber = data[data.length - 1].row_number + 1;
+    await sleep(300);
+  }
+  return all;
+}
+
+async function getMaps() {
+  const [projects, users] = await Promise.all([listProjects(), listUsers()]);
+  return {
+    projMap: Object.fromEntries(projects.map(p => [p.id, p])),
+    userMap: Object.fromEntries(users.map(u => [u.id, u])),
+    users,
+  };
+}
+
+function fmtDur(secs) {
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function toHrs(secs) { return Math.round(secs / 36) / 100; }
+
+// ── MCP Server ────────────────────────────────────────────────────────────────
+function buildMcpServer() {
+  const server = new McpServer({ name: 'mcp-toggl', version: '2.0.0' });
+
+  server.tool(
+    'list_workspace_members',
+    'List all members of the Toggl workspace with their IDs and emails',
+    {},
+    async () => {
+      const users = await listUsers();
+      return { content: [{ type: 'text', text: JSON.stringify(users, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'list_projects',
+    'List all Toggl projects with their client names',
+    {},
+    async () => {
+      const projects = await listProjects();
+      return { content: [{ type: 'text', text: JSON.stringify(projects, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'get_time_entries',
+    'Get detailed time entries for all workspace members (or a specific user) between two dates',
+    {
+      start_date: z.string().describe('Start date YYYY-MM-DD'),
+      end_date:   z.string().describe('End date YYYY-MM-DD'),
+      user_name:  z.string().optional().describe('Filter by user name (partial match, case-insensitive)'),
+    },
+    async ({ start_date, end_date, user_name }) => {
+      const { projMap, userMap, users } = await getMaps();
+      let userIds;
+      if (user_name) {
+        const matched = users.filter(u => u.name.toLowerCase().includes(user_name.toLowerCase()));
+        if (!matched.length) return { content: [{ type: 'text', text: `No user found matching "${user_name}"` }] };
+        userIds = matched.map(u => u.id);
+      }
+      const raw = await fetchEntries(start_date, end_date, userIds);
+      const rows = [];
+      for (const e of raw) {
+        const proj = projMap[e.project_id] ?? { name: 'No project', client: '' };
+        const user = userMap[e.user_id]    ?? { name: e.username ?? 'Unknown', email: '' };
+        for (const te of e.time_entries ?? []) {
+          rows.push({
+            user: user.name, client: proj.client, project: proj.name,
+            description: e.description ?? '', start: te.start, stop: te.stop,
+            duration_hrs: toHrs(te.seconds), duration: fmtDur(te.seconds),
+          });
+        }
+      }
+      rows.sort((a, b) => b.start.localeCompare(a.start));
+      const total = rows.reduce((s, r) => s + r.duration_hrs, 0);
+      return { content: [{ type: 'text', text: `${rows.length} entries · ${Math.round(total * 100) / 100} hrs\n\n${JSON.stringify(rows, null, 2)}` }] };
+    }
+  );
+
+  server.tool(
+    'get_daily_summary',
+    'Get a summary of what each team member worked on for a specific day',
+    {
+      date:      z.string().describe('Date YYYY-MM-DD'),
+      user_name: z.string().optional().describe('Filter by user name (partial match, case-insensitive)'),
+    },
+    async ({ date, user_name }) => {
+      const { projMap, userMap, users } = await getMaps();
+      let userIds;
+      if (user_name) {
+        const matched = users.filter(u => u.name.toLowerCase().includes(user_name.toLowerCase()));
+        if (!matched.length) return { content: [{ type: 'text', text: `No user found matching "${user_name}"` }] };
+        userIds = matched.map(u => u.id);
+      }
+      const raw = await fetchEntries(date, date, userIds);
+      if (!raw.length) return { content: [{ type: 'text', text: `No time entries found for ${date}` }] };
+      const byUser = {};
+      for (const e of raw) {
+        const user = userMap[e.user_id] ?? { name: e.username ?? 'Unknown' };
+        const proj = projMap[e.project_id] ?? { name: 'No project', client: '' };
+        if (!byUser[user.name]) byUser[user.name] = { secs: 0, tasks: [] };
+        const secs = (e.time_entries ?? []).reduce((s, te) => s + te.seconds, 0);
+        byUser[user.name].secs += secs;
+        const label = [
+          proj.client && `[${proj.client}]`,
+          proj.name !== 'No project' && proj.name,
+          e.description,
+        ].filter(Boolean).join(' — ');
+        if (label) byUser[user.name].tasks.push(`  ${fmtDur(secs)}: ${label}`);
+      }
+      const lines = [`Daily summary for ${date}`, '─'.repeat(40)];
+      for (const [name, { secs, tasks }] of Object.entries(byUser).sort()) {
+        lines.push(`\n${name} — ${fmtDur(secs)} (${toHrs(secs)} hrs)`);
+        lines.push(...tasks);
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  server.tool(
+    'get_user_summary',
+    'Get total hours per team member for a date range, broken down by project',
+    {
+      start_date: z.string().describe('Start date YYYY-MM-DD'),
+      end_date:   z.string().describe('End date YYYY-MM-DD'),
+    },
+    async ({ start_date, end_date }) => {
+      const { projMap, userMap } = await getMaps();
+      const raw = await fetchEntries(start_date, end_date);
+      const byUser = {};
+      for (const e of raw) {
+        const user = userMap[e.user_id] ?? { name: e.username ?? 'Unknown' };
+        const proj = projMap[e.project_id] ?? { name: 'No project', client: '' };
+        if (!byUser[user.name]) byUser[user.name] = { secs: 0, byProj: {} };
+        const secs = (e.time_entries ?? []).reduce((s, te) => s + te.seconds, 0);
+        byUser[user.name].secs += secs;
+        const key = proj.client ? `${proj.client} › ${proj.name}` : proj.name;
+        byUser[user.name].byProj[key] = (byUser[user.name].byProj[key] ?? 0) + secs;
+      }
+      const lines = [`User summary: ${start_date} → ${end_date}`, '─'.repeat(40)];
+      for (const [name, { secs, byProj }] of Object.entries(byUser).sort()) {
+        lines.push(`\n${name} — ${fmtDur(secs)} (${toHrs(secs)} hrs)`);
+        for (const [proj, s] of Object.entries(byProj).sort(([, a], [, b]) => b - a))
+          lines.push(`  ${fmtDur(s).padEnd(8)} ${proj}`);
+      }
+      return { content: [{ type: 'text', text: lines.join('\n') }] };
+    }
+  );
+
+  return server;
+}
+
+// ── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// Sessions: sessionId -> { proc, pending: Map<id, resolver>, buffer, timer }
-const sessions = new Map();
-const SESSION_TTL = 30 * 60 * 1000;
+const authCodes = {};
 
-// --- OAuth 2.0 PKCE routes ---
+// ── OAuth 2.0 PKCE routes ─────────────────────────────────────────────────────
 app.get('/.well-known/oauth-protected-resource', (req, res) => {
-    const base = `https://${req.headers.host}`;
-    res.json({ resource: `${base}/mcp`, authorization_servers: [base] });
+  const base = `https://${req.headers.host}`;
+  res.json({ resource: `${base}/mcp`, authorization_servers: [base] });
 });
 
 app.get('/.well-known/oauth-authorization-server', (req, res) => {
-    const base = `https://${req.headers.host}`;
-    res.json({
-        issuer: base,
-        authorization_endpoint: `${base}/authorize`,
-        token_endpoint: `${base}/oauth/token`,
-        grant_types_supported: ['authorization_code', 'client_credentials'],
-        code_challenge_methods_supported: ['S256'],
-        response_types_supported: ['code']
-    });
+  const base = `https://${req.headers.host}`;
+  res.json({
+    issuer: base,
+    authorization_endpoint: `${base}/authorize`,
+    token_endpoint: `${base}/oauth/token`,
+    grant_types_supported: ['authorization_code', 'client_credentials'],
+    code_challenge_methods_supported: ['S256'],
+    response_types_supported: ['code'],
+  });
 });
 
 app.get('/authorize', (req, res) => {
-    const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
-    if (client_id !== OAUTH_CLIENT_ID) { res.status(401).json({ error: 'invalid_client' }); return; }
-    if (response_type !== 'code') { res.status(400).json({ error: 'unsupported_response_type' }); return; }
-    if (!code_challenge) { res.status(400).json({ error: 'code_challenge required' }); return; }
-    const code = randomUUID();
-    authCodes[code] = { codeChallenge: code_challenge, codeChallengeMethod: code_challenge_method || 'S256', redirectUri: redirect_uri, expiresAt: Date.now() + 5 * 60 * 1000 };
-    const redirectUrl = new URL(redirect_uri);
-    redirectUrl.searchParams.set('code', code);
-    if (state) redirectUrl.searchParams.set('state', state);
-    res.redirect(redirectUrl.toString());
+  const { response_type, client_id, redirect_uri, code_challenge, code_challenge_method, state } = req.query;
+  if (client_id !== OAUTH_CLIENT_ID) { res.status(401).json({ error: 'invalid_client' }); return; }
+  if (response_type !== 'code') { res.status(400).json({ error: 'unsupported_response_type' }); return; }
+  if (!code_challenge) { res.status(400).json({ error: 'code_challenge required' }); return; }
+  const code = randomUUID();
+  authCodes[code] = {
+    codeChallenge: code_challenge, codeChallengeMethod: code_challenge_method || 'S256',
+    redirectUri: redirect_uri, expiresAt: Date.now() + 5 * 60 * 1000,
+  };
+  const redirectUrl = new URL(redirect_uri);
+  redirectUrl.searchParams.set('code', code);
+  if (state) redirectUrl.searchParams.set('state', state);
+  res.redirect(redirectUrl.toString());
 });
 
 app.post('/oauth/token', (req, res) => {
-    if (!OAUTH_CLIENT_ID || !AUTH_TOKEN) { res.status(500).json({ error: 'server_misconfigured' }); return; }
-    const grant_type = req.body.grant_type;
-    if (grant_type === 'authorization_code') {
-        const { code, code_verifier, redirect_uri } = req.body;
-        const stored = authCodes[code];
-        if (!stored || stored.expiresAt < Date.now()) { res.status(400).json({ error: 'invalid_grant' }); return; }
-        const expected = createHash('sha256').update(code_verifier).digest('base64url');
-        if (expected !== stored.codeChallenge) { res.status(400).json({ error: 'invalid_grant' }); return; }
-        if (redirect_uri && redirect_uri !== stored.redirectUri) { res.status(400).json({ error: 'invalid_grant' }); return; }
-        delete authCodes[code];
-        res.json({ access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 86400 });
-        return;
-    }
-    if (!OAUTH_CLIENT_SECRET) { res.status(500).json({ error: 'server_misconfigured' }); return; }
-    let client_id, client_secret;
-    const basicAuth = req.headers['authorization'];
-    if (basicAuth?.startsWith('Basic ')) {
-        const decoded = Buffer.from(basicAuth.slice(6), 'base64').toString();
-        const colon = decoded.indexOf(':');
-        client_id = decoded.slice(0, colon); client_secret = decoded.slice(colon + 1);
-    } else { client_id = req.body.client_id; client_secret = req.body.client_secret; }
-    if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) { res.status(401).json({ error: 'invalid_client' }); return; }
+  if (!OAUTH_CLIENT_ID || !AUTH_TOKEN) { res.status(500).json({ error: 'server_misconfigured' }); return; }
+  const grant_type = req.body.grant_type;
+  if (grant_type === 'authorization_code') {
+    const { code, code_verifier, redirect_uri } = req.body;
+    const stored = authCodes[code];
+    if (!stored || stored.expiresAt < Date.now()) { res.status(400).json({ error: 'invalid_grant' }); return; }
+    const expected = createHash('sha256').update(code_verifier).digest('base64url');
+    if (expected !== stored.codeChallenge) { res.status(400).json({ error: 'invalid_grant' }); return; }
+    if (redirect_uri && redirect_uri !== stored.redirectUri) { res.status(400).json({ error: 'invalid_grant' }); return; }
+    delete authCodes[code];
     res.json({ access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 86400 });
+    return;
+  }
+  if (!OAUTH_CLIENT_SECRET) { res.status(500).json({ error: 'server_misconfigured' }); return; }
+  let client_id, client_secret;
+  const basicAuth = req.headers['authorization'];
+  if (basicAuth?.startsWith('Basic ')) {
+    const decoded = Buffer.from(basicAuth.slice(6), 'base64').toString();
+    const colon = decoded.indexOf(':');
+    client_id = decoded.slice(0, colon); client_secret = decoded.slice(colon + 1);
+  } else { client_id = req.body.client_id; client_secret = req.body.client_secret; }
+  if (client_id !== OAUTH_CLIENT_ID || client_secret !== OAUTH_CLIENT_SECRET) {
+    res.status(401).json({ error: 'invalid_client' }); return;
+  }
+  res.json({ access_token: AUTH_TOKEN, token_type: 'Bearer', expires_in: 86400 });
 });
 
-// --- Bearer token middleware ---
+// ── Bearer token middleware ────────────────────────────────────────────────────
 app.use((req, res, next) => {
-    if (['/health', '/authorize', '/oauth/token'].includes(req.path) || req.path.startsWith('/.well-known/')) return next();
-    if (!AUTH_TOKEN) return next();
-    const authHeader = req.headers['authorization'];
-    if (!authHeader?.startsWith('Bearer ')) {
-        res.status(401).set('WWW-Authenticate', `Bearer resource_metadata="https://${req.headers.host}/.well-known/oauth-protected-resource"`).json({ error: 'Unauthorized' });
-        return;
-    }
-    if (authHeader.slice(7) !== AUTH_TOKEN) {
-        res.status(401).set('WWW-Authenticate', 'Bearer error="invalid_token"').json({ error: 'Unauthorized' });
-        return;
-    }
-    next();
+  if (['/health', '/authorize', '/oauth/token'].includes(req.path) || req.path.startsWith('/.well-known/')) return next();
+  if (!AUTH_TOKEN) return next();
+  const authHeader = req.headers['authorization'];
+  if (!authHeader?.startsWith('Bearer ')) {
+    res.status(401).set('WWW-Authenticate', `Bearer resource_metadata="https://${req.headers.host}/.well-known/oauth-protected-resource"`).json({ error: 'Unauthorized' });
+    return;
+  }
+  if (authHeader.slice(7) !== AUTH_TOKEN) {
+    res.status(401).set('WWW-Authenticate', 'Bearer error="invalid_token"').json({ error: 'Unauthorized' });
+    return;
+  }
+  next();
 });
 
-function createSession(sessionId) {
-  const bin = join(__dirname, 'node_modules', '.bin', 'mcp-toggl');
-  const proc = spawn('node', [bin], {
-    env: { ...process.env },
-    stdio: ['pipe', 'pipe', 'inherit'],
-  });
-
-  const session = { proc, pending: new Map(), buffer: '', timer: null };
-
-  proc.stdout.on('data', (chunk) => {
-    session.buffer += chunk.toString();
-    const lines = session.buffer.split('\n');
-    session.buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const msg = JSON.parse(line);
-        if (msg.id != null) {
-          const resolver = session.pending.get(String(msg.id));
-          if (resolver) {
-            session.pending.delete(String(msg.id));
-            resolver(msg);
-          }
-        }
-      } catch { /* skip non-JSON stdout */ }
-    }
-  });
-
-  proc.on('exit', () => {
-    sessions.delete(sessionId);
-    session.pending.forEach(resolve =>
-      resolve({ jsonrpc: '2.0', error: { code: -32603, message: 'Process exited' }, id: null })
-    );
-  });
-
-  resetTTL(sessionId, session);
-  sessions.set(sessionId, session);
-  return session;
-}
-
-function resetTTL(sessionId, session) {
-  if (session.timer) clearTimeout(session.timer);
-  session.timer = setTimeout(() => {
-    session.proc.kill();
-    sessions.delete(sessionId);
-  }, SESSION_TTL);
-}
-
-function sendRequest(session, message) {
-  return new Promise((resolve, reject) => {
-    const id = message.id ?? randomUUID();
-    const msg = { ...message, id };
-    const timeout = setTimeout(() => {
-      session.pending.delete(String(id));
-      reject(new Error('Request timed out'));
-    }, 30_000);
-    session.pending.set(String(id), (response) => {
-      clearTimeout(timeout);
-      resolve(response);
-    });
-    session.proc.stdin.write(JSON.stringify(msg) + '\n');
-  });
-}
-
-app.post('/mcp', async (req, res) => {
-  let sessionId = req.headers['mcp-session-id'];
-  let session;
-  if (sessionId && sessions.has(sessionId)) {
-    session = sessions.get(sessionId);
-    resetTTL(sessionId, session);
-  } else {
-    sessionId = randomUUID();
-    session = createSession(sessionId);
-  }
-
-  res.setHeader('mcp-session-id', sessionId);
-
-  const body = req.body;
-
-  if (body.id == null) {
-    session.proc.stdin.write(JSON.stringify(body) + '\n');
-    return res.status(202).end();
-  }
-
-  try {
-    const response = await sendRequest(session, body);
-    res.json(response);
-  } catch (err) {
-    res.status(500).json({ jsonrpc: '2.0', error: { code: -32603, message: err.message }, id: body.id ?? null });
-  }
+// ── MCP endpoint ──────────────────────────────────────────────────────────────
+app.all('/mcp', async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
+  const server = buildMcpServer();
+  await server.connect(transport);
+  await transport.handleRequest(req, res, req.body);
+  res.on('close', () => server.close());
 });
 
-app.get('/health', (_, res) => res.json({ status: 'ok', sessions: sessions.size }));
+app.get('/health', (_, res) => res.json({ status: 'ok', service: 'mcp-toggl', version: '2.0.0' }));
 
-app.listen(PORT, () => console.log(`Toggl MCP proxy on :${PORT}`));
+app.listen(PORT, () => console.log(`Toggl MCP on :${PORT}`));
