@@ -305,13 +305,41 @@ app.use((req, res, next) => {
   next();
 });
 
+// ── MCP session management ────────────────────────────────────────────────────
+const SESSION_TTL = 30 * 60 * 1000;
+const sessions = new Map(); // sessionId -> { server, transport, timer }
+
+function closeSession(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s) return;
+  clearTimeout(s.timer);
+  try { s.server.close(); } catch {}
+  sessions.delete(sessionId);
+}
+
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
 app.all('/mcp', async (req, res) => {
-  const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => randomUUID() });
-  const server = buildMcpServer();
-  await server.connect(transport);
+  const isInit = req.body?.method === 'initialize';
+  let sessionId = req.headers['mcp-session-id'];
+
+  if (isInit || !sessionId || !sessions.has(sessionId)) {
+    // Start a new session
+    sessionId = randomUUID();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
+    const server = buildMcpServer();
+    await server.connect(transport);
+    const timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
+    sessions.set(sessionId, { server, transport, timer });
+  } else {
+    // Reset TTL on activity
+    const s = sessions.get(sessionId);
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
+  }
+
+  const { transport } = sessions.get(sessionId);
+  res.setHeader('mcp-session-id', sessionId);
   await transport.handleRequest(req, res, req.body);
-  res.on('close', () => server.close());
 });
 
 app.get('/health', (_, res) => res.json({ status: 'ok', service: 'mcp-toggl', version: '2.0.0' }));
