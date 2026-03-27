@@ -350,6 +350,7 @@ app.use((req, res, next) => {
 // ── MCP session management ────────────────────────────────────────────────────
 const SESSION_TTL = 30 * 60 * 1000;
 const sessions = new Map(); // sessionId -> { server, transport, timer }
+const sessionMap = new Map(); // staleSessionId -> activeSessionId
 
 function closeSession(sessionId) {
   const s = sessions.get(sessionId);
@@ -357,6 +358,11 @@ function closeSession(sessionId) {
   clearTimeout(s.timer);
   try { s.server.close(); } catch {}
   sessions.delete(sessionId);
+  // Clean up any sessionMap entries pointing to this closed session
+  for (const [stale, active] of sessionMap) {
+    if (active === sessionId) sessionMap.delete(stale);
+  }
+  console.log(`[SESSION] Closed session ${sessionId}, sessionMap size: ${sessionMap.size}`);
 }
 
 // ── MCP endpoint ──────────────────────────────────────────────────────────────
@@ -364,19 +370,58 @@ app.all('/mcp', async (req, res) => {
   const isInit = req.body?.method === 'initialize';
   let sessionId = req.headers['mcp-session-id'];
 
-  if (isInit || !sessionId || !sessions.has(sessionId)) {
-    // Start a new session
+  if (isInit || !sessionId) {
+    // Explicit initialize or no session header — always create fresh
     sessionId = randomUUID();
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
     const server = buildMcpServer();
     await server.connect(transport);
     const timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
     sessions.set(sessionId, { server, transport, timer });
-  } else {
-    // Reset TTL on activity
+    console.log(`[SESSION] New session ${sessionId} (init=${isInit})`);
+  } else if (sessions.has(sessionId)) {
+    // Known active session — reset TTL
     const s = sessions.get(sessionId);
     clearTimeout(s.timer);
     s.timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
+  } else if (sessionMap.has(sessionId)) {
+    // Stale ID that was already remapped — follow the mapping
+    const activeId = sessionMap.get(sessionId);
+    if (sessions.has(activeId)) {
+      console.log(`[SESSION] Remapped stale ${sessionId} -> existing active ${activeId}`);
+      sessionId = activeId;
+      const s = sessions.get(sessionId);
+      clearTimeout(s.timer);
+      s.timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
+    } else {
+      // The active session also expired — create a new one and update mapping
+      const newId = randomUUID();
+      const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => newId });
+      const server = buildMcpServer();
+      await server.connect(transport);
+      const timer = setTimeout(() => closeSession(newId), SESSION_TTL);
+      sessions.set(newId, { server, transport, timer });
+      sessionMap.set(sessionId, newId);
+      console.log(`[SESSION] Re-remapped stale ${sessionId} -> new ${newId} (previous active gone)`);
+      sessionId = newId;
+    }
+  } else {
+    // Unknown stale ID — create new session and store mapping
+    const staleId = sessionId;
+    sessionId = randomUUID();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: () => sessionId });
+    const server = buildMcpServer();
+    await server.connect(transport);
+    const timer = setTimeout(() => closeSession(sessionId), SESSION_TTL);
+    sessions.set(sessionId, { server, transport, timer });
+    // Cap sessionMap at 100 entries
+    if (sessionMap.size >= 100) {
+      const oldest = sessionMap.keys().next().value;
+      sessionMap.delete(oldest);
+      console.log(`[SESSION] sessionMap full, evicted oldest mapping ${oldest}`);
+    }
+    sessionMap.set(staleId, sessionId);
+    console.log(`[SESSION] Mapped stale ${staleId} -> new ${sessionId}`);
   }
 
   const { transport } = sessions.get(sessionId);
