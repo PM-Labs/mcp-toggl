@@ -9,26 +9,52 @@ const PORT              = parseInt(process.env.PORT || '8080');
 const AUTH_TOKEN        = process.env.MCP_AUTH_TOKEN?.trim();
 const OAUTH_CLIENT_ID   = process.env.OAUTH_CLIENT_ID?.trim();
 const OAUTH_CLIENT_SECRET = process.env.OAUTH_CLIENT_SECRET?.trim();
-const TOGGL_API_KEY     = process.env.TOGGL_API_KEY ?? '';
 const WORKSPACE_ID      = process.env.TOGGL_WORKSPACE_ID ?? '';
 
-const TOGGL_AUTH = Buffer.from(`${TOGGL_API_KEY}:api_token`).toString('base64');
+// Multi-key rotation: TOGGL_API_KEYS (comma-separated) is preferred. Falls back to
+// the legacy single TOGGL_API_KEY for backwards-compat with un-migrated deploys.
+// Rotation is sticky-on-rate-limit: a successful request leaves the key index where
+// it is; only 402/429 advances the index. If every key in the pool reports a
+// rate-limit in one cycle, we fall back to the previous sleep-and-retry behaviour.
+const KEYS = (process.env.TOGGL_API_KEYS || process.env.TOGGL_API_KEY || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+if (!KEYS.length) throw new Error('No Toggl API key configured (set TOGGL_API_KEYS or TOGGL_API_KEY)');
+let keyIndex = 0;
+console.log(`[KEY] Loaded ${KEYS.length} Toggl API key(s); starting on index 0`);
+
+const currentAuth = () => Buffer.from(`${KEYS[keyIndex]}:api_token`).toString('base64');
+
+function rotateKey(reason) {
+  if (KEYS.length <= 1) return false;
+  const prev = keyIndex;
+  keyIndex = (keyIndex + 1) % KEYS.length;
+  console.log(`[KEY] Rotated ${prev}→${keyIndex} (pool size ${KEYS.length}) — reason: ${reason}`);
+  return true;
+}
 
 // ── Toggl API helpers ─────────────────────────────────────────────────────────
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function togglRequest(method, path, body, attempt = 1) {
+async function togglRequest(method, path, body, attempt = 1, rotations = 0) {
   const res = await fetch(`https://api.track.toggl.com${path}`, {
     method,
-    headers: { 'Authorization': `Basic ${TOGGL_AUTH}`, 'Content-Type': 'application/json' },
+    headers: { 'Authorization': `Basic ${currentAuth()}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
   if (res.status === 402 || res.status === 429) {
     const text = await res.text();
+    // Try a fresh key first; only sleep if every key in the pool has been tried this cycle.
+    if (rotations < KEYS.length - 1 && rotateKey(`HTTP ${res.status} on key ${keyIndex}`)) {
+      return togglRequest(method, path, body, attempt, rotations + 1);
+    }
     const match = text.match(/reset in (\d+) second/);
     const wait  = match ? parseInt(match[1]) + 5 : 65;
-    if (attempt <= 3) { await sleep(wait * 1000); return togglRequest(method, path, body, attempt + 1); }
-    throw new Error(`Rate limit exceeded after 3 attempts`);
+    if (attempt <= 3) {
+      console.log(`[KEY] All ${KEYS.length} keys rate-limited — sleeping ${wait}s before retry (attempt ${attempt}/3)`);
+      await sleep(wait * 1000);
+      return togglRequest(method, path, body, attempt + 1, 0);
+    }
+    throw new Error(`Rate limit exceeded across all ${KEYS.length} keys after 3 attempts`);
   }
   if (!res.ok) { const t = await res.text(); throw new Error(`Toggl ${res.status} ${path}: ${t.slice(0, 200)}`); }
   return res.json();
