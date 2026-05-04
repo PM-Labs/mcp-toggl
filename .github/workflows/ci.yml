@@ -82,9 +82,11 @@ jobs:
       - name: Deploy to droplet
         run: |
           ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} \
-            "cd /opt/pmin-mcpinfrastructure && \
-             docker compose pull toggl && \
-             docker compose up -d --force-recreate toggl"
+            "echo '${{ secrets.GHCR_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin \
+            && cd /opt/pmin-mcpinfrastructure \
+            && docker compose pull toggl \
+            && docker compose up -d --force-recreate toggl \
+            && docker logout ghcr.io"
 
       - name: Health check
         run: |
